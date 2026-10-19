@@ -1,0 +1,16 @@
+.browser-profile/
+data/
+logs/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+code_review/
+code_review.zip
+.vscode/
+.idea/

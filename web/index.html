@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Job Reader · Local dashboard</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/" aria-label="Job Reader home"><span class="brand-icon">jr<span>.</span></span><span>Job Reader<small>YOUR LOCAL WORKSPACE</small></span></a><span class="local-tag"><span class="dot"></span> Runs on your computer</span></header>
+  <main>
+    <div class="intro"><div><p class="eyebrow">LINKEDIN + INTERNSHALA</p><h1>Your job search, collected.</h1><p class="muted">Choose a search. Collect the descriptions. Review the JSON.</p></div><span class="version">LOCAL / 02</span></div>
+    <div id="notice" class="notice" role="alert" hidden></div>
+    <div class="workspace">
+      <aside class="panel control-panel">
+        <div class="panel-heading"><span class="section-number">01</span><h2>Collection setup</h2></div>
+        <form id="setup">
+          <label for="source">Website</label>
+          <select id="source"><option value="linkedin">LinkedIn jobs</option><option value="internshala">Internshala internships</option></select>
+          <label for="search-url">Search URL</label>
+          <textarea id="search-url" rows="5" spellcheck="false" required placeholder="https://www.linkedin.com/jobs/search-results/?keywords=data%20analyst"></textarea>
+          <p class="hint">Paste a LinkedIn or Internshala search link. The website is detected automatically. Changes apply to your next run.</p>
+          <div class="form-row"><div><label for="limit">Target jobs</label><input id="limit" type="number" min="1" max="1000" step="1" value="1000" required></div><div><label for="delay">Delay (seconds)</label><input id="delay" type="number" min="1" step="0.5" value="3" required></div></div>
+          <label class="checkbox"><input type="checkbox" id="resume" checked><span>Resume today's progress<small>Saved postings are always skipped across days and searches.</small></span></label>
+          <div class="actions"><button id="start" class="primary" type="submit">Start collection <span aria-hidden="true">↗</span></button><button id="stop" class="secondary" type="button" disabled>Stop</button></div>
+        </form>
+        <div class="setup-note"><span class="tiny-label">BROWSER SESSION</span><p>Uses your dedicated Chrome session for either website. Chrome starts automatically when needed.</p><p>Keep Chrome open while collecting. Verification stops the run; you can resume after completing it.</p></div>
+      </aside>
+      <section class="monitor" aria-label="Collection progress">
+        <div class="panel monitor-panel">
+          <div class="panel-heading"><span class="section-number">02</span><h2>Collection monitor</h2><span id="status" class="status" aria-live="polite">Loading</span></div>
+          <div class="metrics"><div class="main-metric"><span class="tiny-label">JOBS SAVED</span><strong id="saved">0</strong><span class="muted">of <span id="target">1,000</span> target</span></div><div class="small-metrics"><div><span class="tiny-label">ATTEMPTED</span><strong id="attempted">0</strong></div><div><span class="tiny-label">ERRORS</span><strong id="errors">0</strong></div><div><span class="tiny-label">ALREADY SAVED / SKIPPED</span><strong id="skipped">0</strong></div><div><span class="tiny-label">QUEUED</span><strong id="pending">0</strong></div></div></div>
+          <div class="progress-meta"><span id="percent">0% collected</span><span id="updated">Waiting for a run</span></div><progress id="progress" max="100" value="0" aria-label="Saved jobs toward target"></progress>
+          <div class="run-message"><span id="message-dot" class="dot"></span><p id="run-message" aria-live="polite">Loading saved progress...</p></div>
+          <div class="output-row"><div><span class="tiny-label">RESULT FILE · <span id="run-source">LinkedIn</span></span><p id="output-name">No result selected</p></div><a id="download" class="download disabled" href="#" download aria-disabled="true">Download JSON <span aria-hidden="true">↓</span></a></div>
+        </div>
+        <div class="panel jobs-panel"><div class="panel-heading"><span class="section-number">03</span><h2>Recently collected</h2><span class="subtle">Latest 20</span></div><div id="jobs" class="jobs-list"><p class="empty">Saved jobs will appear here.</p></div></div>
+      </section>
+    </div>
+    <section class="panel history-panel"><div class="panel-heading"><h2>Saved runs</h2><span class="subtle">Select a run to inspect its progress</span><button id="follow" class="text-button" hidden>Return to current run</button></div><div class="table-wrap"><table><thead><tr><th>Result file</th><th>Website</th><th>Saved</th><th>Errors</th><th>Status</th><th>Updated</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="history"></tbody></table></div></section>
+    <footer><span>Local storage. No paid APIs or hosted scraping service.</span><span>Up to 1,000 jobs per search · Actual availability varies</span></footer>
+  </main>
+  <dialog id="job-dialog"><div class="dialog-heading"><div><p class="eyebrow" id="detail-company"></p><h2 id="detail-title"></h2></div><button class="secondary" id="close-dialog" aria-label="Close job description">Close</button></div><p class="muted" id="detail-meta"></p><a id="detail-link" target="_blank" rel="noopener noreferrer">Open listing ↗</a><pre id="detail-description"></pre></dialog>
+</body></html>
