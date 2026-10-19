@@ -104,6 +104,7 @@ class ReaderTests(unittest.TestCase):
 
     def test_main_saves_partial_work_on_verification(self):
         def blocked(args, result, output):
+            args.output_ready = True  # Simulate an initialized checkpoint, not a startup failure.
             result["jobs"].append({"link": job(123)})
             raise reader.AccessBlocked("verification")
 
@@ -119,6 +120,8 @@ class ReaderTests(unittest.TestCase):
 
     def test_disabled_pager_is_not_clicked(self):
         page = Mock(url=reader.DEFAULT_SEARCH)
+        page.evaluate.return_value = []
+        page.get_by_role.return_value.all.return_value = []
         button = Mock()
         page.locator.return_value.all.return_value = [button]
         page.locator.return_value.count.return_value = 1

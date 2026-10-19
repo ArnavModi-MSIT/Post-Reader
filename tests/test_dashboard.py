@@ -57,6 +57,31 @@ class DashboardTests(unittest.TestCase):
         _, description = self.request("/api/job?file=jobs_sample.json&id=123")
         self.assertEqual(json.loads(description)["description"], "SQL and Python")
 
+    def test_job_filter_pagination_and_quality_counts(self):
+        sample = {"jobs": [{"job_id": str(i), "title": f"Analyst {i}", "company": "Fixture",
+                           "description": "Partial ... more" if i == 0 else "Full responsibilities.",
+                           "link": f"https://www.linkedin.com/jobs/view/{i}/"} for i in range(25)], "errors": []}
+        reader.save_result(Path(self.temp.name) / "many.json", sample)
+        _, body = self.request("/api/state?file=many.json&page=2")
+        state = json.loads(body)
+        self.assertEqual(state["jobs_pages"], 2)
+        self.assertEqual(len(state["jobs"]), 5)
+        self.assertEqual(state["incomplete"], 1)
+        _, body = self.request("/api/state?file=many.json&quality=suspected_truncated")
+        self.assertEqual(json.loads(body)["jobs_matching"], 1)
+        _, body = self.request("/api/state?file=many.json&q=Analyst%2024")
+        self.assertEqual(json.loads(body)["jobs_matching"], 1)
+
+    def test_history_reads_at_most_forty_results_and_bounds_cache(self):
+        for i in range(60):
+            reader.save_result(Path(self.temp.name) / f"history_{i}.json", {"jobs": [], "errors": []})
+        with patch.object(self.manager, "read_file", wraps=self.manager.read_file) as read:
+            self.assertEqual(len(self.manager.history()), 40)
+        self.assertLessEqual(read.call_count, 40)
+        for path in Path(self.temp.name).glob("history_*.json"):
+            self.manager.read_file(path.name)
+        self.assertLessEqual(len(self.manager.cache), 45)
+
     def test_download_preserves_saved_records(self):
         _, data = self.request("/api/download?file=jobs_sample.json")
         self.assertEqual(len(json.loads(data)["jobs"]), 1)

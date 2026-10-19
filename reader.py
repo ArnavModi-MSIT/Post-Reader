@@ -6,7 +6,11 @@ import math
 import re
 import sqlite3
 import internshala
-from seen_postings import SeenPostings, posting_key
+import linkedin
+from seen_postings import SeenPostings
+from run_lock import CollectionLock
+from posting_identity import posting_key, canonical_job_url
+from description_quality import annotate, assess_description, MORE_LABEL
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -18,32 +22,8 @@ from playwright.sync_api import sync_playwright
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_SEARCH = "https://www.linkedin.com/jobs/search/?keywords=data%20analyst&location=Delhi%2C%20India"
 LINKEDIN_HOSTS = {"linkedin.com", "www.linkedin.com"}
-DESCRIPTION = ".jobs-description-content__text, .jobs-description__content, .show-more-less-html__markup"
-DESCRIPTION_READY = DESCRIPTION + ', h2:text-is("About the job")'
-RESULT_LINK = 'a[href*="/jobs/view/"], a[href*="currentJobId="]'
-RESULT_ITEM = RESULT_LINK + ', [data-job-id], [data-occludable-job-id], [componentkey^="job-card-component-ref-"]'
-# Prefer the results column so recommended jobs in the detail panel do not enter the queue.
-LINKS_JS = """() => {
-    const visible = el => el.getClientRects().length > 0;
-    const roots = [...document.querySelectorAll(
-        '.jobs-search-results-list, .scaffold-layout__list, .jobs-search-results__list')];
-    const modernCard = document.querySelector('[role="button"][componentkey^="job-card-component-ref-"]');
-    let modernRoot = modernCard && modernCard.parentElement;
-    while (modernRoot && !(modernRoot.scrollHeight > modernRoot.clientHeight + 2 &&
-            /auto|scroll/.test(getComputedStyle(modernRoot).overflowY))) modernRoot = modernRoot.parentElement;
-    const root = roots.find(visible) || modernRoot || document;
-    const links = [...root.querySelectorAll('a[href*="/jobs/view/"], a[href*="currentJobId="]')]
-        .map(el => el.href);
-    for (const card of root.querySelectorAll('[data-job-id], [data-occludable-job-id]')) {
-        const id = card.getAttribute('data-job-id') || card.getAttribute('data-occludable-job-id');
-        if (/^\d+$/.test(id || '')) links.push('https://www.linkedin.com/jobs/view/' + id + '/');
-    }
-    for (const card of root.querySelectorAll('[componentkey^="job-card-component-ref-"]')) {
-        const id = card.getAttribute('componentkey').replace('job-card-component-ref-', '');
-        if (/^\d+$/.test(id)) links.push('https://www.linkedin.com/jobs/view/' + id + '/');
-    }
-    return [...new Set(links)];
-}"""
+from linkedin import DESCRIPTION, DESCRIPTION_READY, RESULT_LINK, RESULT_ITEM, LINKS_JS
+
 
 
 class AccessBlocked(RuntimeError):
@@ -59,6 +39,52 @@ def check_cancel(event):
         raise KeyboardInterrupt
 
 
+def interruptible_wait(page, milliseconds, stop_event=None):
+    event = stop_event or vars(page).get("_reader_stop_event")
+    remaining = max(0, milliseconds)
+    while remaining:
+        check_cancel(event)
+        step = min(250, remaining)
+        page.wait_for_timeout(step)
+        remaining -= step
+    check_cancel(event)
+
+
+class TransientReadError(RuntimeError):
+    """A temporary network/server condition eligible for bounded retry."""
+
+
+def error_category(exc):
+    if isinstance(exc, AccessBlocked):
+        return "access_blocked"
+    if isinstance(exc, PlaywrightTimeoutError):
+        return "timeout"
+    if isinstance(exc, TransientReadError) or (isinstance(exc, PlaywrightError) and
+            any(value in str(exc) for value in ("net::ERR_CONNECTION", "net::ERR_TIMED_OUT", "Execution context was destroyed"))):
+        return "transient_navigation"
+    return "layout_or_data" if isinstance(exc, ValueError) else "browser_error"
+
+
+def read_with_retry(detail, url, args, result, page):
+    retries = getattr(args, "retries", 1)
+    for attempt in range(retries + 1):
+        check_cancel(getattr(args, "stop_event", None))
+        try:
+            record = detail.read(url)
+            if not isinstance(record, dict) or posting_key(record.get("link")) != posting_key(url):
+                raise ValueError("Detail reader returned a different or invalid posting identity.")
+            if "description" in record:
+                record["extraction_attempts"] = attempt + 1
+            return record
+        except (AccessBlocked, BrowserStopped):
+            raise
+        except (PlaywrightError, RuntimeError) as exc:
+            if error_category(exc) not in {"timeout", "transient_navigation"} or attempt == retries:
+                raise
+            result["retried"] = result.get("retried", 0) + 1
+            interruptible_wait(page, min(8000, 1000 * 2 ** attempt), getattr(args, "stop_event", None))
+
+
 def target_closed(exc):
     return any(text in str(exc).lower() for text in (
         "target page, context or browser has been closed", "browser has been closed", "target closed"))
@@ -71,7 +97,7 @@ def search_url(value):
     if (parts.scheme != "https" or parts.hostname not in LINKEDIN_HOSTS
             or parts.username or parts.password or parts.port not in (None, 443)
             or parts.path.rstrip("/") not in {"/jobs/search", "/jobs/search-results"}):
-        raise argparse.ArgumentTypeError("Use a LinkedIn job-search URL or https://internshala.com/internships/ URL.")
+        raise argparse.ArgumentTypeError("Use a LinkedIn job-search URL or Internshala jobs/internships search URL.")
     query = dict(parse_qsl(parts.query))
     # A selected listing must not pin an old job when starting a new daily run.
     for key in ("currentJobId", "originToLandingJobPostings"):
@@ -80,19 +106,46 @@ def search_url(value):
     return urlunsplit(("https", "www.linkedin.com", parts.path, urlencode(query), ""))
 
 
-def canonical_job_url(value):
-    parts = urlsplit(value)
-    if parts.hostname in internshala.HOSTS:
-        return internshala.canonical_job_url(value)
-    if parts.hostname not in LINKEDIN_HOSTS:
-        return None
-    match = re.fullmatch(r"/jobs/view/(?:[^/]*-)?(\d+)/?", parts.path)
-    job_id = match.group(1) if match else None
-    if not job_id and parts.path.rstrip("/") in {"/jobs/search", "/jobs/search-results"}:
-        job_id = dict(parse_qsl(parts.query)).get("currentJobId")
-    if job_id and job_id.isascii() and job_id.isdigit():
-        return f"https://www.linkedin.com/jobs/view/{job_id}/"
-    return None
+def search_signature(url):
+    normalized = urlsplit(search_url(url))
+    path = "/jobs/search" if normalized.hostname in LINKEDIN_HOSTS else normalized.path.rstrip("/")
+    query = tuple(sorted((key, value) for key, value in parse_qsl(normalized.query)
+                         if key not in {"start", "origin", "trackingId", "trk"}))
+    return normalized.hostname, path, query
+
+
+def validate_checkpoint(value, search):
+    if not isinstance(value, dict) or value.get("schema_version") != 2:
+        raise ValueError("Existing output has an unsupported checkpoint schema; file preserved.")
+    if search_signature(value.get("search_url", "")) != search_signature(search):
+        raise ValueError("Checkpoint belongs to a different search; file preserved.")
+    for field in ("jobs", "errors"):
+        if not isinstance(value.get(field), list) or any(not isinstance(row, dict) for row in value[field]):
+            raise ValueError(f"Invalid checkpoint {field}; file preserved.")
+    source = "internshala" if urlsplit(search).hostname in internshala.HOSTS else "linkedin"
+    for job in value["jobs"]:
+        if any(field in job and not isinstance(job[field], str) for field in ("title", "description", "company", "job_id")):
+            raise ValueError("Invalid posting fields in checkpoint; file preserved.")
+        key = posting_key(job.get("link"))
+        if not key or key[0] != source:
+            raise ValueError("Invalid posting in checkpoint; file preserved.")
+    progress = value.get("progress")
+    if not isinstance(progress, dict):
+        raise ValueError("Invalid checkpoint progress; file preserved.")
+    if search_signature(progress.get("results_page_url", "")) != search_signature(search):
+        raise ValueError("Checkpoint results page has different search filters; file preserved.")
+    for field in ("pending_links", "attempted_links"):
+        if not isinstance(progress.get(field), list):
+            raise ValueError(f"Invalid checkpoint {field}; file preserved.")
+        for link in progress[field]:
+            key = posting_key(link)
+            if not key or key[0] != source or canonical_job_url(link) != link:
+                raise ValueError("Invalid job URL in checkpoint; file preserved.")
+    if "page_complete" in progress and not isinstance(progress["page_complete"], bool):
+        raise ValueError("Invalid page-complete flag; file preserved.")
+    if "previously_collected" in progress and (not isinstance(progress["previously_collected"], list)
+            or any(not isinstance(key, str) for key in progress["previously_collected"])):
+        raise ValueError("Invalid duplicate checkpoint; file preserved.")
 
 
 def check_access(page):
@@ -100,9 +153,9 @@ def check_access(page):
         raise RuntimeError("The reader's browser tab was closed.")
     path = urlsplit(page.url).path.lower()
     site = "Internshala" if urlsplit(page.url).hostname in internshala.HOSTS else "LinkedIn"
-    if any(part in path for part in ("/checkpoint", "/login", "/authwall", "/challenge", "/signup")):
+    if any(path == prefix or path.startswith(prefix + "/") for prefix in ("/checkpoint", "/login", "/authwall", "/challenge", "/signup")):
         raise AccessBlocked(f"{site} requires login/verification. Complete it manually before running again.")
-    if site == "Internshala" and re.search(r"just a moment|access denied|security check|verify you are human|attention required|captcha", page.title(), re.I):
+    if site == "Internshala" and re.match(r"^\s*(?:just a moment|access denied|security check|verify you are human|attention required|captcha)(?:\s*[.!|:-]|\s*$)", page.title(), re.I):
         raise AccessBlocked("Internshala requires browser verification or denied access. Complete verification manually before running again.")
     if page.locator('input[name="session_key"]:visible, input#username:visible').count():
         raise AccessBlocked("LinkedIn is displaying a sign-in form. Log in manually before running again.")
@@ -122,27 +175,35 @@ def navigate(page, url):
         try:
             page.wait_for_load_state("domcontentloaded", timeout=10000)
         except PlaywrightTimeoutError:
-            raise RuntimeError("Navigation did not finish; no description was collected.") from exc
+            raise TransientReadError("Navigation did not finish; no description was collected.") from exc
     check_access(page)
     if response is not None:
         if response.status in {401, 403, 429}:
             raise AccessBlocked(f"{urlsplit(url).hostname} returned HTTP {response.status}; stopping this run.")
+        if response.status >= 500:
+            raise TransientReadError(f"Temporary HTTP {response.status}: {url}")
         if response.status >= 400:
             raise ValueError(f"Page returned HTTP {response.status}: {url}")
+    if not canonical_job_url(url):
+        if search_signature(url) != search_signature(page.url):
+            raise ValueError("The requested search redirected to different filters or website; progress was preserved.")
     expected_job = canonical_job_url(url)
-    if expected_job and canonical_job_url(page.url) != expected_job:
+    if expected_job and posting_key(page.url) != posting_key(url):
         raise ValueError("The requested job redirected elsewhere; no description was collected.")
 
 
 def wait_for_content(page, selector):
-    check_access(page)
-    try:
-        # Hidden template copies must not take precedence over a visible description.
-        page.locator(f":is({selector}):visible").first.wait_for(state="visible", timeout=20000)
-    except PlaywrightTimeoutError:
+    for attempt in range(20):
+        check_cancel(vars(page).get("_reader_stop_event"))
         check_access(page)
-        raise
-    check_access(page)
+        try:
+            page.locator(f":is({selector}):visible").first.wait_for(state="visible", timeout=1000)
+            check_access(page)
+            return
+        except PlaywrightTimeoutError:
+            if attempt == 19:
+                check_access(page)
+                raise
 
 
 def first_text(page, selectors):
@@ -193,80 +254,22 @@ def collect_links(page, limit, stop_event=None):
             }
             window.scrollBy(0, window.innerHeight * 0.8);
         }""")
-        page.wait_for_timeout(1000)
+        interruptible_wait(page, 1000, stop_event)
     return list(found)[:limit]
 
 
 def read_job(page, url):
     if urlsplit(url).hostname in internshala.HOSTS:
         return internshala.read_job(page, url)
-    navigate(page, url)
-    wait_for_content(page, DESCRIPTION_READY)
-    semantic_region = None
-    heading = page.get_by_role("heading", name="About the job", exact=True)
-    if heading.count():
-        candidate = heading.first
-        for _ in range(4):
-            candidate = candidate.locator("xpath=..")
-            if len(candidate.inner_text().strip()) > len("About the job") + 30:
-                semantic_region = candidate
-                break
-    # Only expand the description region; unrelated page buttons must not be clicked.
-    region = semantic_region if semantic_region is not None else page.locator(".jobs-description, section.description, #job-details")
-    for button in region.get_by_role("button", name=re.compile(r"^(show more|see more)\b", re.I)).all():
-        if button.is_visible():
-            button.click(timeout=3000)
-            break
-    description = first_text(page, DESCRIPTION)
-    if not description and semantic_region is not None:
-        description = semantic_region.evaluate(r"""el => {
-            // Read rendered text to preserve paragraphs and lists.
-            return el.innerText.replace(/^About the job\s*/i, '').replace(/\n(?:Show more|See more)\s*$/i, '').trim();
-        }""")
-    title = first_text(page, ".job-details-jobs-unified-top-card__job-title, .top-card-layout__title, h1")
-    job_id = url.rstrip("/").split("/")[-1]
-    company = first_text(page, ".job-details-jobs-unified-top-card__company-name, .topcard__org-name-link")
-    metadata = first_text(page, ".job-details-jobs-unified-top-card__primary-description-container, .topcard__flavor-row")
-    if not title or not company or not metadata:
-        modern_header = page.evaluate("""() => {
-            for (const company of document.querySelectorAll('a[href*="/company/"]')) {
-                if (!company.getClientRects().length || !company.innerText.trim()) continue;
-                let root = company.parentElement;
-                for (let i=0; root && i<5; i++, root=root.parentElement) {
-                    const paragraphs = [...root.querySelectorAll('p')].filter(p =>
-                        !p.querySelector('a[href*="/company/"]') && p.innerText.trim() &&
-                        p.innerText.trim() !== company.innerText.trim());
-                    if (paragraphs.length >= 2 && !root.querySelector('h2')) {
-                        return {company: company.innerText.trim(), title: paragraphs[0].innerText.trim(),
-                            metadata: paragraphs.slice(1).map(p=>p.innerText.trim()).join('\\n')};
-                    }
-                }
-            }
-            return {};
-        }""")
-        title = title or modern_header.get("title", "")
-        company = company or modern_header.get("company", "")
-        metadata = metadata or modern_header.get("metadata", "")
-    if not description or not title:
-        raise ValueError("No visible job title/description found; page layout may have changed.")
-    return {
-        "source": "linkedin",
-        "job_id": url.rstrip("/").split("/")[-1],
-        "link": url,
-        "title": title,
-        "company": company,
-        "location_and_posting_info": metadata,
-        "criteria": first_text(page, ".description__job-criteria-list, .job-details-jobs-unified-top-card__job-insight"),
-        "description": description,
-        "collected_at": datetime.now(timezone.utc).isoformat(),
-    }
+    return linkedin.read_job(page, url)
 
 
 class DetailReader:
-    def __init__(self, context, owned_pages):
+    def __init__(self, context, owned_pages, stop_event=None):
         self.context = context
         self.owned_pages = owned_pages
         self.page = None
+        self.stop_event = stop_event
 
     def read(self, url):
         for attempt in range(2):
@@ -274,6 +277,7 @@ class DetailReader:
                 if self.page is None or self.page.is_closed():
                     self.page = self.context.new_page()
                     self.page.set_default_timeout(10000)
+                    self.page._reader_stop_event = self.stop_event
                     self.owned_pages.append(self.page)
                 return read_job(self.page, url)
             except PlaywrightError as exc:
@@ -297,23 +301,12 @@ def save_result(path, result):
 def next_results(page):
     if urlsplit(page.url).hostname in internshala.HOSTS:
         return internshala.next_results(page)
-    before = page.evaluate(LINKS_JS)
-    buttons = page.locator('button[data-testid="pagination-controls-next-button"], button[aria-label="View next page"], button[aria-label="Next"], a[aria-label="Next"]')
-    if not buttons.count():
-        buttons = page.get_by_role("button", name=re.compile(r"^Next(?:\s+page)?$", re.I))
-    for button in buttons.all():
-        if button.is_visible() and button.is_enabled() and button.get_attribute("aria-disabled") != "true":
-            button.click(timeout=10000)
-            try:
-                page.wait_for_function(
-                    f"previous => JSON.stringify(({LINKS_JS})()) !== JSON.stringify(previous) && ({LINKS_JS})().length > 0",
-                    arg=before, timeout=20000)
-            except PlaywrightTimeoutError:
-                check_access(page)
-                raise RuntimeError("Next-page control did not load different results; stopping instead of rereading stale jobs.")
-            check_access(page)
-            return True
-    return False
+    from pagination import advance
+    return advance(page, [
+        page.locator('button[data-testid="pagination-controls-next-button"], button[aria-label="View next page"], button[aria-label="Next"], a[aria-label="Next"], a[rel="next"]'),
+        page.get_by_role("button", name=re.compile(r"^Next(?:\s+page)?$", re.I)),
+        page.get_by_role("link", name=re.compile(r"^Next(?:\s+page)?$", re.I)),
+    ], job_links)
 
 
 def choose_search(context, explicit_url):
@@ -333,11 +326,66 @@ def choose_search(context, explicit_url):
     return search_url(DEFAULT_SEARCH)
 
 
+def persist_record(result, record, output, history):
+    if "description" in record:
+        annotate(record)
+    key = posting_key(record.get("link"))
+    for index, old in enumerate(result["jobs"]):
+        if posting_key(old.get("link")) == key:
+            result["jobs"][index] = record
+            break
+    else:
+        result["jobs"].append(record)
+    result["complete_candidates"] = sum(assess_record(job) == "complete_candidate" for job in result["jobs"])
+    result["incomplete"] = len(result["jobs"]) - result["complete_candidates"]
+    save_result(output, result)
+    if history is not None:
+        history.remember(record, output)
+
+
+def assess_record(job):
+    return annotate(dict(job))["description_status"]
+
+
+def collect_repairs(page, detail, args, result, output):
+    history = args.seen_store
+    source = "internshala" if urlsplit(result["search_url"]).hostname in internshala.HOSTS else "linkedin"
+    candidates = history.retry_candidates(source, args.limit)
+    result["run_mode"] = "retry_incomplete"
+    consecutive_errors = 0
+    for record in candidates:
+        check_cancel(getattr(args, "stop_event", None))
+        url = record["link"]
+        result["progress"]["pending_links"] = [item["link"] for item in candidates
+                                               if item["link"] not in result["progress"]["attempted_links"]]
+        save_result(output, result)
+        try:
+            replacement = read_with_retry(detail, url, args, result, page)
+            replacement["replaces_collected_at"] = record.get("collected_at")
+            persist_record(result, replacement, output, history)
+            consecutive_errors = 0
+        except (AccessBlocked, BrowserStopped):
+            raise
+        except (PlaywrightError, ValueError, RuntimeError) as exc:
+            result["errors"].append({"link": url, "error": str(exc), "category": error_category(exc), "exception_type": type(exc).__name__})
+            consecutive_errors += 1
+        result["progress"]["attempted_links"].append(url)
+        result["progress"]["pending_links"].remove(url)
+        save_result(output, result)
+        if consecutive_errors >= 5:
+            raise RuntimeError("Five consecutive repair failures; stopping this run.")
+        interruptible_wait(page, args.delay * 1000, getattr(args, "stop_event", None))
+    result["progress"]["pending_links"] = []
+    result.update(status="partial" if result["errors"] or result.get("incomplete", 0) else "completed",
+                  stop_reason=f"Repair pass finished: {len(candidates)} previously incomplete postings attempted. Original JSON files were preserved.")
+
+
 def collect_jobs(page, detail, args, result, output):
     stop_event = getattr(args, "stop_event", None)
     check_cancel(stop_event)
     progress = result.setdefault("progress", {"results_page_url": result["search_url"], "pending_links": [], "attempted_links": []})
     seen = {job["link"] for job in result["jobs"]} | set(progress["attempted_links"])
+    seen_keys = {posting_key(url) for url in seen}
     navigate(page, progress["results_page_url"])
     consecutive_errors = 0
     history = getattr(args, "seen_store", None)
@@ -346,14 +394,17 @@ def collect_jobs(page, detail, args, result, output):
 
     def new_links(candidates):
         fresh = []
+        queued_keys = set()
         for url in candidates:
-            if url in seen:
+            identity = posting_key(url)
+            if identity in seen_keys or identity in queued_keys:
                 continue
-            if history is not None and history.contains(url):
+            if history is not None and history.was_seen(url):
                 key = posting_key(url)
                 skipped.add(":".join(key))
                 continue
             fresh.append(url)
+            queued_keys.add(identity)
         progress["previously_collected"] = sorted(skipped)
         result["duplicates_skipped"] = len(skipped)
         return fresh
@@ -377,11 +428,15 @@ def collect_jobs(page, detail, args, result, output):
                     result["stop_reason"] = "Results repeated a page with no new postings; progress was kept."
                     break
                 exhausted_pages.add(fingerprint)
-                if next_results(page):
+                outcome = next_results(page)
+                if hasattr(outcome, "to_dict"):
+                    result["pagination"] = outcome.to_dict()
+                if outcome:
+                    result["pages_advanced"] = result.get("pages_advanced", 0) + 1
                     progress.update(results_page_url=page.url, page_complete=False)
                     save_result(output, result)
                     continue
-                result["stop_reason"] = "No enabled next-page control; all currently accessible results collected."
+                result["stop_reason"] = getattr(outcome, "reason", "No usable Next control found; check pagination diagnostics.")
                 break
             result["stop_reason"] = "No new job links; results exhausted or pagination did not advance."
             break
@@ -390,37 +445,44 @@ def collect_jobs(page, detail, args, result, output):
             if len(result["jobs"]) >= args.limit:
                 break
             print(f"Reading job {len(seen) + 1}; saved {len(result['jobs'])}: {url}", flush=True)
+            record = None
             try:
-                result["jobs"].append(detail.read(url))
+                record = read_with_retry(detail, url, args, result, page)
                 consecutive_errors = 0
             except AccessBlocked as exc:
-                result["errors"].append({"link": url, "error": str(exc)})
+                result["errors"].append({"link": url, "error": str(exc), "category": error_category(exc), "exception_type": type(exc).__name__})
                 raise
             except BrowserStopped:
                 raise
             except (PlaywrightError, ValueError, RuntimeError) as exc:
                 if isinstance(exc, PlaywrightError) and target_closed(exc):
                     raise BrowserStopped("Chrome connection closed. Pending jobs saved for the next run.") from exc
-                result["errors"].append({"link": url, "error": str(exc)})
+                result["errors"].append({"link": url, "error": str(exc), "category": error_category(exc), "exception_type": type(exc).__name__})
                 consecutive_errors += 1
             seen.add(url)
+            seen_keys.add(posting_key(url))
             progress["attempted_links"].append(url)
             progress["pending_links"].remove(url)
-            save_result(output, result)
-            if history is not None and result["jobs"] and result["jobs"][-1].get("link") == url:
-                history.remember(result["jobs"][-1], output)
+            if record is not None:
+                persist_record(result, record, output, history)
+            else:
+                save_result(output, result)
             if consecutive_errors >= 5:
                 raise RuntimeError("Five consecutive description failures; stopping this run.")
             if len(result["jobs"]) < args.limit:
-                page.wait_for_timeout(args.delay * 1000)
+                interruptible_wait(page, args.delay * 1000, stop_event)
         if len(result["jobs"]) >= args.limit:
             result["stop_reason"] = "Requested limit reached."
             break
         progress["page_complete"] = True
         save_result(output, result)
-        if not next_results(page):
-            result["stop_reason"] = "No enabled next-page control; all currently accessible results collected."
+        outcome = next_results(page)
+        if hasattr(outcome, "to_dict"):
+            result["pagination"] = outcome.to_dict()
+        if not outcome:
+            result["stop_reason"] = getattr(outcome, "reason", "No usable Next control found; check pagination diagnostics.")
             break
+        result["pages_advanced"] = result.get("pages_advanced", 0) + 1
         progress.update(results_page_url=page.url, page_complete=False)
         save_result(output, result)
     result["status"] = "completed" if len(result["jobs"]) >= args.limit else "partial"
@@ -440,23 +502,21 @@ def prepare_output(args, result, search):
     args.output_ready = False
     if args.output.exists() and not args.fresh:
         previous = json.loads(args.output.read_text(encoding="utf-8"))
-        if (previous.get("schema_version") != 2 or previous.get("search_url") != search
-                or not isinstance(previous.get("jobs"), list) or not isinstance(previous.get("errors"), list)
-                or not isinstance(previous.get("progress"), dict)):
-            raise ValueError("Existing output is not a compatible checkpoint. Use --fresh with a new --output path; the existing file was preserved.")
-        progress = previous["progress"]
-        # Validate persisted URLs before using them in a browser.
-        search_url(progress["results_page_url"])
-        if any(canonical_job_url(link) != link for link in progress["pending_links"] + progress["attempted_links"]):
-            raise ValueError("Invalid job URLs in the checkpoint; existing output was preserved.")
+        validate_checkpoint(previous, search)
         result.clear()
         result.update(previous)
+        successful = {posting_key(job["link"]) for job in result["jobs"]}
+        failed = list(dict.fromkeys(error.get("link") for error in result["errors"]
+                                    if posting_key(error.get("link")) and posting_key(error["link"]) not in successful))
+        progress = result["progress"]
+        progress["attempted_links"] = [url for url in progress["attempted_links"] if url not in failed]
+        progress["pending_links"] = list(dict.fromkeys(failed + progress["pending_links"]))
         print(f"Resuming {len(result['jobs'])} saved jobs, {len(progress['pending_links'])} pending links: {args.output}", flush=True)
     result.update(schema_version=2, source="internshala" if urlsplit(search).hostname in internshala.HOSTS else "linkedin",
                   search_url=search, requested_limit=args.limit, status="running", stop_reason=None)
     result.setdefault("progress", {"results_page_url": search, "pending_links": [], "attempted_links": []})
-    args.output_ready = True
     save_result(args.output, result)
+    args.output_ready = True
 
 
 def run_browser(args, result, output):
@@ -483,7 +543,13 @@ def run_browser(args, result, output):
                 if isinstance(previous, dict):
                     for record in previous.get("jobs", []):
                         history.remember(record, args.output)
+            if getattr(args, "retry_incomplete", False):
+                args.output = BASE_DIR / "data" / ("repair_" + daily_output_path(result["search_url"], True).name) if args.output is None else args.output
+                if args.output.exists():
+                    raise ValueError("Repair output already exists. Choose a new output path; existing file preserved.")
+                args.fresh = True
             prepare_output(args, result, result["search_url"])
+            result["history_quality"] = history.quality_counts()
             for record in result["jobs"]:
                 history.remember(record, args.output)
             args.seen_store = history
@@ -498,8 +564,12 @@ def run_browser(args, result, output):
             owned_pages.append(context.new_page())
             for page in owned_pages:
                 page.set_default_timeout(10000)
-            detail = DetailReader(context, owned_pages)
-            collect_jobs(owned_pages[0], detail, args, result, args.output)
+                page._reader_stop_event = getattr(args, "stop_event", None)
+            detail = DetailReader(context, owned_pages, getattr(args, "stop_event", None))
+            if getattr(args, "retry_incomplete", False):
+                collect_repairs(owned_pages[0], detail, args, result, args.output)
+            else:
+                collect_jobs(owned_pages[0], detail, args, result, args.output)
         finally:
             if history is not None:
                 history.close()
@@ -516,17 +586,20 @@ def run_browser(args, result, output):
 
 
 def execute(args):
-    args.output_ready = True
+    args.output_ready = False
     stamp = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d_%H-%M-%S_%f")
     output = args.output or BASE_DIR / "data" / f"jobs_{stamp}.json"
     result = {"search_url": args.url, "collected_at": datetime.now(timezone.utc).isoformat(),
               "requested_limit": args.limit, "status": "running", "stop_reason": None,
               "jobs": [], "errors": []}
     try:
-        run_browser(args, result, output)
+        with CollectionLock(BASE_DIR / "data" / ".collection.lock"):
+            run_browser(args, result, output)
     except AccessBlocked as exc:
         result.update(status="blocked", stop_reason=str(exc))
-    except (PlaywrightError, ValueError, RuntimeError, OSError, KeyError, TypeError, sqlite3.Error) as exc:
+        if hasattr(exc, "pagination"):
+            result["pagination"] = exc.pagination
+    except (PlaywrightError, ValueError, RuntimeError, OSError, KeyError, TypeError, sqlite3.Error, argparse.ArgumentTypeError) as exc:
         result.update(status="failed", stop_reason=str(exc))
     except KeyboardInterrupt:
         result.update(status="interrupted", stop_reason="Stopped by user.")
@@ -552,9 +625,11 @@ def main():
     parser.add_argument("--cdp", default="http://127.0.0.1:9222")
     parser.add_argument("--launch", action="store_true")
     parser.add_argument("--fresh", action="store_true", help="Start an independent run instead of resuming today's JSON")
+    parser.add_argument("--retry-incomplete", action="store_true", help="Repair previously incomplete postings for the selected website")
+    parser.add_argument("--retries", type=int, default=1, help="Transient retries per listing (0..3)")
     parser.add_argument("--delay", type=float, default=3.0)
     args = parser.parse_args()
-    if not 1 <= args.limit <= 1000 or not math.isfinite(args.delay) or args.delay < 1:
+    if not 0 <= args.retries <= 3 or not 1 <= args.limit <= 1000 or not math.isfinite(args.delay) or args.delay < 1:
         parser.error("--limit must be 1..1000 and --delay must be a finite number of at least 1")
     return execute(args)[1]
 

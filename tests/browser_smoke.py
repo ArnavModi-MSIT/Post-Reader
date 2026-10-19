@@ -42,9 +42,9 @@ this.disabled=true;">Next</button></body></html>"""
 
 
 def main():
-    chrome = Path(os.environ["ProgramFiles"]) / "Google/Chrome/Application/chrome.exe"
+    chrome = Path(os.environ.get("ProgramFiles", "/nonexistent")) / "Google/Chrome/Application/chrome.exe"
     with sync_playwright() as p:
-        browser = p.chromium.launch(executable_path=str(chrome), headless=True)
+        browser = p.chromium.launch(executable_path=str(chrome) if chrome.exists() else None, headless=True)
         try:
             context = browser.new_context(service_workers="block")
             def route_request(route):

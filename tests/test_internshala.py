@@ -15,6 +15,27 @@ JOB = "https://internshala.com/internship/detail/work-from-home-data-analytics-i
 
 
 class InternshalaTests(unittest.TestCase):
+    def test_jobs_search_preserves_salary_filter(self):
+        search = "https://internshala.com/jobs/work-from-home/salary-6"
+        self.assertEqual(reader.search_url(search), search + "/")
+        self.assertEqual(reader.search_url(search + "/page-3/?keywords=python"), search + "/?keywords=python")
+        self.assertEqual(reader.search_url("https://internshala.com/fresher-jobs/work-from-home/"),
+                         "https://internshala.com/fresher-jobs/work-from-home/")
+
+    def test_job_detail_identity_does_not_collide_with_internship(self):
+        from posting_identity import posting_key
+        from seen_postings import SeenPostings
+        job = "https://internshala.com/job/detail/remote-analyst123"
+        internship = "https://internshala.com/internship/detail/analyst123"
+        self.assertEqual(reader.canonical_job_url(job + "?tracking=test"), job)
+        self.assertEqual(posting_key(job), posting_key(job.replace("/job/", "/fresher-job/")))
+        self.assertNotEqual(posting_key(job), posting_key(internship))
+        with tempfile.TemporaryDirectory(dir=reader.BASE_DIR) as folder:
+            with SeenPostings(Path(folder) / "history.sqlite3") as history:
+                history.remember({"link": job, "title": "Analyst", "description": "Full responsibilities."}, "jobs.json")
+                self.assertTrue(history.contains(job))
+                self.assertFalse(history.contains(internship))
+
     def test_search_is_supported_and_page_cursor_resets(self):
         self.assertEqual(reader.search_url(SEARCH), SEARCH)
         self.assertEqual(reader.search_url(SEARCH + "page-3/?keywords=python"), SEARCH + "?keywords=python")
@@ -126,6 +147,37 @@ class InternshalaTests(unittest.TestCase):
                 patch.object(reader, 'check_access'), patch.object(reader, 'navigate') as navigate:
             self.assertTrue(internshala.next_results(page))
         navigate.assert_called_once_with(page, SEARCH+'page-2/')
+
+    def test_scroll_waits_through_delayed_batch(self):
+        page = Mock(url=SEARCH)
+        with patch.object(internshala, "job_links", side_effect=[[JOB]] * 6 + [[JOB, JOB+"2"]]), \
+                patch.object(reader, "check_access"), patch.object(reader, "interruptible_wait") as wait:
+            result = internshala.scroll_more(page, timeout=5)
+        self.assertTrue(result)
+        self.assertEqual(result.method, "scroll")
+        self.assertGreaterEqual(wait.call_count, 5)
+
+    def test_no_pager_uses_scroll_loader(self):
+        from pagination import PaginationResult
+        page = Mock(url=SEARCH)
+        page.locator.return_value.all.return_value = []
+        page.get_by_role.return_value.all.return_value = []
+        with patch.object(internshala, "job_links", return_value=[JOB]), \
+                patch.object(internshala, "scroll_more", return_value=PaginationResult("advanced", SEARCH, 2)) as scroll:
+            self.assertTrue(internshala.next_results(page))
+        scroll.assert_called_once_with(page)
+
+    def test_scroll_idle_and_cancellation(self):
+        page = Mock(url=SEARCH)
+        with patch.object(internshala, "job_links", return_value=[JOB]), \
+                patch.object(reader, "check_access"), patch.object(reader, "interruptible_wait"):
+            result = internshala.scroll_more(page, timeout=1)
+        self.assertEqual(result.status, "scroll_idle")
+        self.assertNotIn("Next control", result.reason)
+        event = threading.Event()
+        event.set()
+        with patch.object(internshala, "job_links", return_value=[JOB]), self.assertRaises(KeyboardInterrupt):
+            internshala.scroll_more(page, stop_event=event)
 
     def test_stopped_collection_makes_no_browser_requests(self):
         event = threading.Event()

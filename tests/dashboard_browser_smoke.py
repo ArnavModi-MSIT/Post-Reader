@@ -38,8 +38,8 @@ def main():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         with sync_playwright() as p:
-            chrome = Path(os.environ["ProgramFiles"]) / "Google/Chrome/Application/chrome.exe"
-            browser = p.chromium.launch(executable_path=str(chrome), headless=True)
+            chrome = Path(os.environ.get("ProgramFiles", "/nonexistent")) / "Google/Chrome/Application/chrome.exe"
+            browser = p.chromium.launch(executable_path=str(chrome) if chrome.exists() else None, headless=True)
             try:
                 page = browser.new_page(viewport={"width": 1440, "height": 1100}, accept_downloads=True)
                 errors = []
@@ -65,19 +65,32 @@ def main():
                 expect(page.locator('#status')).to_have_text('interrupted')
                 assert page.locator('#saved').inner_text() == '2'
                 assert not page.locator('#start').is_disabled()
+                expect(page.locator('#complete_candidates')).to_have_text('2')
+                page.locator('#job-query').fill('Analyst 0')
+                expect(page.locator('#jobs .job-row')).to_have_count(1)
+                page.locator('#job-quality').select_option('suspected_truncated')
+                expect(page.locator('#jobs .job-row')).to_have_count(0)
+                page.locator('#job-quality').select_option('all')
+                page.locator('#job-query').fill('')
+                expect(page.locator('#jobs .job-row')).to_have_count(2)
                 page.get_by_role('button', name='Inspect').first.click()
                 page.locator('#follow').wait_for(state='visible')
+                page.locator('#retry-incomplete').check()
                 page.locator('#source').select_option('internshala')
                 expect(page.locator('#search-url')).to_have_value(reader.internshala.DEFAULT_SEARCH)
                 page.get_by_role('button', name='Start collection').click()
                 expect(page.locator('#run-source')).to_have_text('Internshala')
                 expect(page.locator('#saved')).to_have_text('2')
                 assert received[-1].url == reader.internshala.DEFAULT_SEARCH
+                assert received[-1].retry_incomplete is True
+                assert received[-1].output.name.startswith('repair_')
                 page.get_by_role('button', name='View description').first.click()
                 expect(page.locator('#detail-link')).to_have_attribute('href', 'https://internshala.com/internship/detail/test1001')
                 page.get_by_role('button', name='Close job description').click()
                 page.get_by_role('button', name='Stop', exact=True).click()
                 expect(page.locator('#status')).to_have_text('interrupted')
+                page.locator('#source').select_option('internshala_jobs')
+                expect(page.locator('#search-url')).to_have_value(reader.internshala.DEFAULT_JOBS_SEARCH)
                 page.set_viewport_size({"width": 390, "height": 844})
                 overflow = page.evaluate("""() => [...document.querySelectorAll('body *')]
                     .filter(el=>el.getBoundingClientRect().right > window.innerWidth + 1)

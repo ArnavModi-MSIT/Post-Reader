@@ -72,7 +72,7 @@ class HistoryTests(unittest.TestCase):
                 advance.assert_called_once()
                 self.assertEqual(result["duplicates_skipped"], 1)
                 self.assertTrue(history.contains(job(2)))
-                self.assertEqual(json.loads((folder / "today.json").read_text(encoding="utf-8"))["jobs"], [record(2)])
+                self.assertEqual(json.loads((folder / "today.json").read_text(encoding="utf-8"))["jobs"][0]["link"], job(2))
 
     def test_failed_description_is_not_remembered(self):
         with tempfile.TemporaryDirectory(dir=reader.BASE_DIR) as folder:

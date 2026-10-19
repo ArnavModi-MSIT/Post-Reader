@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 from urllib.request import urlopen
 
 import reader
+from description_quality import annotate
 
 
 def source_name(url):
@@ -74,15 +75,21 @@ class Manager:
         if cached and cached[0] == stamp:
             return cached[1]
         value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value.get("jobs"), list) or not isinstance(value.get("errors"), list):
+        if not isinstance(value, dict) or not isinstance(value.get("jobs"), list) or not isinstance(value.get("errors"), list):
             raise ValueError("Not a job-result file.")
+        if any(not isinstance(job, dict) for job in value["jobs"]):
+            raise ValueError("Invalid job records.")
         with self.lock:
             self.cache[name] = (stamp, value)
+            while len(self.cache) > 45:
+                self.cache.pop(next(iter(self.cache)))
         return value
 
     def history(self):
         rows = []
         for path in sorted(self.data_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            if len(rows) >= 40:
+                break
             try:
                 value = self.read_file(path.name)
             except (OSError, ValueError, TypeError):
@@ -91,7 +98,7 @@ class Manager:
                          "source": value.get("source") or source_name(value.get("search_url")),
                          "status": value.get("status", "unknown"), "updated_at": value.get("updated_at"),
                          "search_url": value.get("search_url", "")})
-        return rows[:40]
+        return rows
 
     def settings(self):
         try:
@@ -108,6 +115,9 @@ class Manager:
             raise ValueError("Target must be a whole number from 1 to 1,000.")
         if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < 1:
             raise ValueError("Delay must be at least one second.")
+        retry_incomplete = payload.get("retry_incomplete", False)
+        if not isinstance(retry_incomplete, bool):
+            raise ValueError("Invalid repair setting.")
         fresh = payload.get("fresh", False)
         if not isinstance(fresh, bool):
             raise ValueError("Invalid resume setting.")
@@ -116,9 +126,12 @@ class Manager:
                 raise RuntimeError("A collection is already running. Stop it before starting another.")
             self.stop_event = threading.Event()
             output = self.data_dir / reader.daily_output_path(url, fresh).name
+            if retry_incomplete:
+                output = self.data_dir / ("repair_" + reader.daily_output_path(url, True).name)
+                fresh = True
             self.args = SimpleNamespace(url=url, limit=limit, delay=delay, fresh=fresh, output=output,
                                         profile=BASE_DIR / ".browser-profile", cdp="http://127.0.0.1:9222",
-                                        launch=False, stop_event=self.stop_event)
+                                        launch=False, stop_event=self.stop_event, retries=1, retry_incomplete=retry_incomplete)
             self.phase, self.message = "starting", "Preparing Chrome and loading the search..."
             (self.data_dir / "ui_settings.json").write_text(
                 json.dumps({"url": url, "limit": limit, "delay": delay}, indent=2), encoding="utf-8")
@@ -146,7 +159,7 @@ class Manager:
                 self.phase = "stopping"
                 self.message = "Stopping after the current browser operation; saved jobs will be kept."
 
-    def snapshot(self, selected=None):
+    def snapshot(self, selected=None, query="", page=1, quality="all"):
         history = self.history()
         with self.lock:
             running = bool(self.thread and self.thread.is_alive())
@@ -168,18 +181,30 @@ class Manager:
             else:
                 status = phase
         progress = value.get("progress", {})
-        jobs = value.get("jobs", [])
+        jobs = [annotate(dict(job)) for job in value.get("jobs", [])]
         errors = value.get("errors", [])
         if is_active and running and status == "running":
             message = "Collecting job descriptions. Each saved job is written to JSON automatically."
+        counts = {"complete_candidate": 0, "suspected_truncated": 0, "missing": 0}
+        for job in jobs:
+            counts[job["description_status"]] += 1
+        filtered = [job for job in reversed(jobs) if
+                    (not query or query.casefold() in " ".join(str(job.get(k, "")) for k in ("title", "company", "description")).casefold())
+                    and (quality == "all" or job["description_status"] == quality)]
+        page_count = max(1, (len(filtered) + 19) // 20)
+        page = min(max(1, page), page_count)
+        visible = filtered[(page-1)*20:page*20]
         return {"app": APP_ID, "token": self.token, "running": running, "active_file": active_file,
                 "source": value.get("source") or source_name(value.get("search_url", args.url if args else "")),
                 "file": chosen, "status": status, "message": message if is_active else value.get("stop_reason", ""),
+                "complete_candidates": counts["complete_candidate"], "incomplete": counts["suspected_truncated"] + counts["missing"],
+                "retried": value.get("retried", 0), "pages_advanced": value.get("pages_advanced", 0), "pagination": value.get("pagination"),
+                "jobs_page": page, "jobs_pages": page_count, "jobs_matching": len(filtered),
                 "skipped": value.get("duplicates_skipped", 0), "saved": len(jobs), "errors": len(errors), "attempted": len(progress.get("attempted_links", [])),
                 "pending": len(progress.get("pending_links", [])), "target": value.get("requested_limit", args.limit if args else 1000),
                 "updated_at": value.get("updated_at"), "search_url": value.get("search_url", args.url if args else ""),
-                "jobs": [{k: job.get(k, "") for k in ("job_id", "title", "company", "link", "location_and_posting_info")}
-                         for job in reversed(jobs[-20:])], "last_error": errors[-1] if errors else None,
+                "jobs": [{k: job.get(k, "") for k in ("job_id", "title", "company", "link", "location_and_posting_info", "description_status")}
+                         for job in visible], "last_error": errors[-1] if errors else None,
                 "history": history, "settings": self.settings()}
 
 
@@ -218,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.path == "/api/health":
                 return self.json_reply(200, {"app": APP_ID})
             if path.path == "/api/state":
-                return self.json_reply(200, self.server.app.snapshot(query.get("file", [None])[0]))
+                return self.json_reply(200, self.server.app.snapshot(query.get("file", [None])[0], query.get("q", [""])[0][:200], int(query.get("page", ["1"])[0]), query.get("quality", ["all"])[0]))
             if path.path in {"/api/download", "/api/job"}:
                 name = query.get("file", [""])[0]
                 value = self.server.app.read_file(name)
@@ -237,6 +262,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.json_reply(404, {"error": str(exc)})
 
     def do_POST(self):
+        # Consume a bounded body before rejecting it so Windows clients receive
+        # the HTTP error instead of a reset caused by unread request bytes.
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if not 0 < length <= 16384:
+                return self.json_reply(400, {"error": "A small JSON request is required."})
+            self.connection.settimeout(5)
+            raw = self.rfile.read(length)
+        except (ValueError, OSError):
+            return self.json_reply(400, {"error": "Invalid or incomplete request."})
         if not self.valid_host() or self.headers.get("X-Reader-Token") != self.server.app.token:
             return self.json_reply(403, {"error": "Reload the dashboard before trying again."})
         origin = self.headers.get("Origin")
@@ -246,7 +281,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             if not 0 < length <= 16384 or not self.headers.get("Content-Type", "").startswith("application/json"):
                 raise ValueError("A small JSON request is required.")
-            payload = json.loads(self.rfile.read(length))
+            payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("Expected a JSON object.")
             if self.path == "/api/start":

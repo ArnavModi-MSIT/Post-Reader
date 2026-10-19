@@ -1,11 +1,11 @@
 const $ = id => document.getElementById(id);
-let token = '', selected = null, currentFile = null, initialized = false, polling = false;
-const defaults = {linkedin:'https://www.linkedin.com/jobs/search/?keywords=data%20analyst&location=India',internshala:'https://internshala.com/internships/work-from-home-internships/'};
+let token = '', selected = null, currentFile = null, initialized = false, polling = false, jobsPage = 1;
+const defaults = {linkedin:'https://www.linkedin.com/jobs/search/?keywords=data%20analyst&location=India',internshala:'https://internshala.com/internships/work-from-home-internships/',internshala_jobs:'https://internshala.com/jobs/work-from-home/salary-6/'};
 const sourceLabel = source => source === 'internshala' ? 'Internshala' : 'LinkedIn';
 function detectSource() {
   try {
     const host = new URL($('search-url').value.trim()).hostname;
-    if(/^(www\.)?internshala\.com$/.test(host)) $('source').value = 'internshala';
+    if(/^(www\.)?internshala\.com$/.test(host)) $('source').value = /^\/(jobs|fresher-jobs)(\/|$)/.test(new URL($('search-url').value.trim()).pathname) ? 'internshala_jobs' : 'internshala';
     else if(/^(www\.)?linkedin\.com$/.test(host)) $('source').value = 'linkedin';
     defaults[$('source').value] = $('search-url').value.trim();
   } catch (_) { /* The API validates incomplete or unsupported URLs on submit. */ }
@@ -24,7 +24,9 @@ async function refresh() {
   if(polling) return;
   polling = true;
   try {
-    const data = await api('/api/state' + (selected ? '?file=' + encodeURIComponent(selected) : ''));
+    const params = new URLSearchParams({page:String(jobsPage),q:$('job-query').value,quality:$('job-quality').value});
+    if(selected) params.set('file',selected);
+    const data = await api('/api/state?' + params);
     token = data.token; currentFile = data.file;
     if(!initialized) {
       $('search-url').value = data.settings.url || '';
@@ -33,7 +35,7 @@ async function refresh() {
       detectSource();
       initialized = true;
     }
-    for(const key of ['saved','attempted','errors','pending','target','skipped']) $(key).textContent = number(data[key]);
+    for(const key of ['saved','attempted','errors','pending','target','skipped','complete_candidates','incomplete','retried','pages_advanced']) $(key).textContent = number(data[key]);
     $('status').textContent = data.status; $('status').className = 'status ' + data.status;
     const percent = data.target ? Math.min(100, data.saved / data.target * 100) : 0;
     $('progress').value = percent; $('percent').textContent = percent.toFixed(1) + '% collected';
@@ -45,12 +47,16 @@ async function refresh() {
     $('download').classList.toggle('disabled', !data.file); $('download').setAttribute('aria-disabled', String(!data.file));
     $('start').disabled = data.running; $('stop').disabled = !data.running || data.status === 'stopping';
     $('follow').hidden = !selected;
+    jobsPage = data.jobs_page || 1;
+    $('jobs-page-label').textContent = `Page ${jobsPage} of ${data.jobs_pages || 1} · ${number(data.jobs_matching)} matches`;
+    $('jobs-prev').disabled = jobsPage <= 1; $('jobs-next').disabled = jobsPage >= (data.jobs_pages || 1);
+    $('paging-diagnostics').textContent = data.pagination ? JSON.stringify(data.pagination,null,2) : 'No page advance attempted.';
     $('jobs').replaceChildren();
     if(!data.jobs.length) $('jobs').append(text('p','Saved jobs will appear here.','empty'));
     for(const job of data.jobs) {
       const row = text('div','','job-row');
       row.append(text('span',(job.company || 'JR').slice(0,2).toUpperCase(),'job-icon'));
-      const info = text('div','','job-text'); info.append(text('strong',job.title),text('small',job.company)); row.append(info);
+      const info = text('div','','job-text'); info.append(text('strong',job.title),text('small',job.company),text('small',job.description_status === 'complete_candidate' ? 'Complete candidate' : 'Needs review')); row.append(info);
       const view = text('button','View description','text-button'); view.type = 'button';
       view.addEventListener('click',()=>showJob(data.file,job.job_id)); row.append(view); $('jobs').append(row);
     }
@@ -59,7 +65,7 @@ async function refresh() {
       const row = document.createElement('tr'); if(run.file === data.file) row.className = 'selected';
       row.append(text('td',run.file),text('td',sourceLabel(run.source)),text('td',number(run.count)),text('td',number(run.errors)),text('td',run.status,'history-status'),text('td',date(run.updated_at)));
       const cell = document.createElement('td'), view = text('button','Inspect ↗','text-button'); view.type = 'button';
-      view.addEventListener('click',()=>{ selected = run.file; refresh(); }); cell.append(view); row.append(cell); $('history').append(row);
+      view.addEventListener('click',()=>{ selected = run.file; jobsPage = 1; refresh(); }); cell.append(view); row.append(cell); $('history').append(row);
     }
     if(!data.history.length) { const row=document.createElement('tr'),cell=text('td','No saved runs yet.'); cell.colSpan=7; row.append(cell); $('history').append(row); }
   } catch(error) { notice(error.message); }
@@ -71,6 +77,7 @@ async function showJob(file,id) {
     $('detail-title').textContent = job.title; $('detail-company').textContent = job.company;
     $('detail-meta').textContent = job.location_and_posting_info || '';
     $('detail-description').textContent = job.description || '';
+    $('detail-quality').textContent = 'Description: ' + (job.description_status || 'legacy / unassessed') + ' · ' + number((job.description || '').length) + ' characters';
     const link = new URL(job.link);
     $('detail-link').href = link.protocol === 'https:' && /^(www\.)?(linkedin|internshala)\.com$/.test(link.hostname) ? link.href : '#';
     $('detail-link').textContent = 'Open ' + (/internshala\.com$/.test(link.hostname) ? 'Internshala' : 'LinkedIn') + ' listing ↗';
@@ -80,14 +87,19 @@ async function showJob(file,id) {
 $('setup').addEventListener('submit',async event=>{
   event.preventDefault(); notice(''); $('start').disabled = true;
   try {
-    await api('/api/start',{url:$('search-url').value.trim(),limit:Number($('limit').value),delay:Number($('delay').value),fresh:!$('resume').checked});
-    selected = null; await refresh();
+    await api('/api/start',{url:$('search-url').value.trim(),limit:Number($('limit').value),delay:Number($('delay').value),fresh:!$('resume').checked,retry_incomplete:$('retry-incomplete').checked});
+    selected = null; jobsPage = 1; await refresh();
   } catch(error) { notice(error.message); $('start').disabled = false; }
 });
 $('stop').addEventListener('click',async()=>{ try { notice(''); await api('/api/stop',{}); await refresh(); } catch(error) { notice(error.message); } });
-$('follow').addEventListener('click',()=>{ selected=null; refresh(); });
+$('follow').addEventListener('click',()=>{ selected=null; jobsPage=1; refresh(); });
 $('close-dialog').addEventListener('click',()=>$('job-dialog').close());
 $('download').addEventListener('click',event=>{if(!currentFile) event.preventDefault();});
 $('source').addEventListener('change',()=>{ $('search-url').value = defaults[$('source').value]; });
 $('search-url').addEventListener('input',detectSource);
+$('jobs-prev').addEventListener('click',()=>{jobsPage=Math.max(1,jobsPage-1);refresh();});
+$('jobs-next').addEventListener('click',()=>{jobsPage++;refresh();});
+let filterTimer;
+$('job-query').addEventListener('input',()=>{clearTimeout(filterTimer);filterTimer=setTimeout(()=>{jobsPage=1;refresh();},250);});
+$('job-quality').addEventListener('change',()=>{jobsPage=1;refresh();});
 refresh(); setInterval(refresh,2000);
