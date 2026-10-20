@@ -120,3 +120,11 @@ See [RESEARCH.md](RESEARCH.md) for earlier repository comparisons and design con
 Internshala also supports infinite scrolling: each loaded batch is saved, then the reader scrolls the listing container/window and waits up to 30 seconds for new unique links. A missing Next button does not end the run. If nothing loads within that window, it reports `scroll_idle` and keeps progress for a later resume. Explicit Next controls remain supported for older layouts. The dashboard's result-batch counter includes scroll-loaded batches.
 
 Internshala jobs are supported alongside internships. Choose **Internshala jobs** or paste `https://internshala.com/jobs/work-from-home/salary-6`. `/jobs/`, `/fresher-jobs/` and `/internships/` searches retain their filters and share scrolling, checkpoints and history. Job records include `listing_type`, available `salary` and `experience` fields. Job and internship identity namespaces are separate to avoid collisions while preserving existing internship history.
+
+## Two detail readers
+
+Choose **2 readers — parallel** in the dashboard, or add `--workers 2` to the CDP CLI command. Each worker owns its Playwright connection and detail tab; both attach to the same dedicated Chrome login session. One coordinator writes JSON and SQLite. The saved target, global duplicate protection and checkpoint queue still apply. Single-reader mode remains the default.
+
+Delay applies separately to each reader. Two description requests can overlap, so actual throughput may improve, but it is not guaranteed to double. Stop or verification prevents further scheduling; in-flight browser operations may finish before worker tabs close. Unsaved work remains pending for resume. Two-reader mode also supports repair passes. It requires CDP and cannot be combined with `--launch`.
+
+Run `python tests/parallel_browser_smoke.py` for the isolated CDP concurrency fixture; it starts temporary Chrome and never contacts a job website.

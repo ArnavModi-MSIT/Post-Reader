@@ -115,6 +115,9 @@ class Manager:
             raise ValueError("Target must be a whole number from 1 to 1,000.")
         if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < 1:
             raise ValueError("Delay must be at least one second.")
+        workers = payload.get("workers", 1)
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers not in (1, 2):
+            raise ValueError("Choose one or two readers.")
         retry_incomplete = payload.get("retry_incomplete", False)
         if not isinstance(retry_incomplete, bool):
             raise ValueError("Invalid repair setting.")
@@ -131,10 +134,10 @@ class Manager:
                 fresh = True
             self.args = SimpleNamespace(url=url, limit=limit, delay=delay, fresh=fresh, output=output,
                                         profile=BASE_DIR / ".browser-profile", cdp="http://127.0.0.1:9222",
-                                        launch=False, stop_event=self.stop_event, retries=1, retry_incomplete=retry_incomplete)
+                                        launch=False, stop_event=self.stop_event, retries=1, retry_incomplete=retry_incomplete, workers=workers)
             self.phase, self.message = "starting", "Preparing Chrome and loading the search..."
             (self.data_dir / "ui_settings.json").write_text(
-                json.dumps({"url": url, "limit": limit, "delay": delay}, indent=2), encoding="utf-8")
+                json.dumps({"url": url, "limit": limit, "delay": delay, "workers": workers}, indent=2), encoding="utf-8")
             self.thread = threading.Thread(target=self._work, args=(self.args,), daemon=True)
             self.thread.start()
 

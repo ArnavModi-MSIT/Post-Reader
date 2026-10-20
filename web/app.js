@@ -32,6 +32,7 @@ async function refresh() {
       $('search-url').value = data.settings.url || '';
       $('limit').value = data.settings.limit || 1000;
       $('delay').value = data.settings.delay || 3;
+      $('workers').value = String(data.settings.workers || 1);
       detectSource();
       initialized = true;
     }
@@ -87,7 +88,7 @@ async function showJob(file,id) {
 $('setup').addEventListener('submit',async event=>{
   event.preventDefault(); notice(''); $('start').disabled = true;
   try {
-    await api('/api/start',{url:$('search-url').value.trim(),limit:Number($('limit').value),delay:Number($('delay').value),fresh:!$('resume').checked,retry_incomplete:$('retry-incomplete').checked});
+    await api('/api/start',{url:$('search-url').value.trim(),limit:Number($('limit').value),delay:Number($('delay').value),fresh:!$('resume').checked,retry_incomplete:$('retry-incomplete').checked,workers:Number($('workers').value)});
     selected = null; jobsPage = 1; await refresh();
   } catch(error) { notice(error.message); $('start').disabled = false; }
 });

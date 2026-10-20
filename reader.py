@@ -9,6 +9,7 @@ import internshala
 import linkedin
 from seen_postings import SeenPostings
 from run_lock import CollectionLock
+from parallel_reader import ParallelDetailReader
 from posting_identity import posting_key, canonical_job_url
 from description_quality import annotate, assess_description, MORE_LABEL
 from datetime import datetime, timedelta, timezone
@@ -351,6 +352,8 @@ def collect_repairs(page, detail, args, result, output):
     history = args.seen_store
     source = "internshala" if urlsplit(result["search_url"]).hostname in internshala.HOSTS else "linkedin"
     candidates = history.retry_candidates(source, args.limit)
+    if hasattr(detail, "prime"):
+        detail.prime([item["link"] for item in candidates])
     result["run_mode"] = "retry_incomplete"
     consecutive_errors = 0
     for record in candidates:
@@ -374,7 +377,8 @@ def collect_repairs(page, detail, args, result, output):
         save_result(output, result)
         if consecutive_errors >= 5:
             raise RuntimeError("Five consecutive repair failures; stopping this run.")
-        interruptible_wait(page, args.delay * 1000, getattr(args, "stop_event", None))
+        if not isinstance(detail, ParallelDetailReader):
+            interruptible_wait(page, args.delay * 1000, getattr(args, "stop_event", None))
     result["progress"]["pending_links"] = []
     result.update(status="partial" if result["errors"] or result.get("incomplete", 0) else "completed",
                   stop_reason=f"Repair pass finished: {len(candidates)} previously incomplete postings attempted. Original JSON files were preserved.")
@@ -440,6 +444,8 @@ def collect_jobs(page, detail, args, result, output):
                 break
             result["stop_reason"] = "No new job links; results exhausted or pagination did not advance."
             break
+        if hasattr(detail, "prime"):
+            detail.prime(fresh[:max(0, args.limit - len(result["jobs"]))])
         for url in fresh:
             check_cancel(stop_event)
             if len(result["jobs"]) >= args.limit:
@@ -469,7 +475,7 @@ def collect_jobs(page, detail, args, result, output):
                 save_result(output, result)
             if consecutive_errors >= 5:
                 raise RuntimeError("Five consecutive description failures; stopping this run.")
-            if len(result["jobs"]) < args.limit:
+            if len(result["jobs"]) < args.limit and not isinstance(detail, ParallelDetailReader):
                 interruptible_wait(page, args.delay * 1000, stop_event)
         if len(result["jobs"]) >= args.limit:
             result["stop_reason"] = "Requested limit reached."
@@ -524,6 +530,7 @@ def run_browser(args, result, output):
         context = None
         owned_pages = []
         history = None
+        detail = None
         try:
             if args.launch:
                 context = p.chromium.launch_persistent_context(str(args.profile.resolve()), headless=False)
@@ -565,12 +572,21 @@ def run_browser(args, result, output):
             for page in owned_pages:
                 page.set_default_timeout(10000)
                 page._reader_stop_event = getattr(args, "stop_event", None)
-            detail = DetailReader(context, owned_pages, getattr(args, "stop_event", None))
+            workers = getattr(args, "workers", 1)
+            if workers == 2:
+                if args.launch:
+                    raise ValueError("Two readers require CDP Chrome. Use the dashboard or omit --launch.")
+                detail = ParallelDetailReader(args.cdp, getattr(args, "stop_event", None), args.delay)
+            else:
+                detail = DetailReader(context, owned_pages, getattr(args, "stop_event", None))
+            result["workers"] = workers
             if getattr(args, "retry_incomplete", False):
                 collect_repairs(owned_pages[0], detail, args, result, args.output)
             else:
                 collect_jobs(owned_pages[0], detail, args, result, args.output)
         finally:
+            if isinstance(detail, ParallelDetailReader):
+                detail.close()
             if history is not None:
                 history.close()
             # Cleanup must not mask the original error or close the user's browser/tabs.
@@ -627,10 +643,13 @@ def main():
     parser.add_argument("--fresh", action="store_true", help="Start an independent run instead of resuming today's JSON")
     parser.add_argument("--retry-incomplete", action="store_true", help="Repair previously incomplete postings for the selected website")
     parser.add_argument("--retries", type=int, default=1, help="Transient retries per listing (0..3)")
+    parser.add_argument("--workers", type=int, choices=(1, 2), default=1, help="Independent detail readers (default: 1)")
     parser.add_argument("--delay", type=float, default=3.0)
     args = parser.parse_args()
     if not 0 <= args.retries <= 3 or not 1 <= args.limit <= 1000 or not math.isfinite(args.delay) or args.delay < 1:
         parser.error("--limit must be 1..1000 and --delay must be a finite number of at least 1")
+    if args.launch and args.workers == 2:
+        parser.error("--workers 2 uses debug-enabled Chrome; omit --launch")
     return execute(args)[1]
 
 

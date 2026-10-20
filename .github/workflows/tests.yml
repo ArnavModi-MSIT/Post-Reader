@@ -17,3 +17,4 @@ jobs:
       - run: python tests/internshala_browser_smoke.py
       - run: python tests/reliability_browser_smoke.py
       - run: python tests/dashboard_browser_smoke.py
+      - run: python tests/parallel_browser_smoke.py
