@@ -97,7 +97,7 @@ class ReaderTests(unittest.TestCase):
             path = Path(folder) / "jobs.json"
             reader.save_result(path, {"jobs": [{"description": "Delhi \u20b9"}]})
             original = path.read_text(encoding="utf-8")
-            with patch.object(Path, "replace", side_effect=PermissionError("locked")):
+            with patch.object(Path, "replace", side_effect=PermissionError("locked")), patch.object(reader.time, "sleep"):
                 with self.assertRaises(PermissionError):
                     reader.save_result(path, {"jobs": []})
             self.assertEqual(path.read_text(encoding="utf-8"), original)

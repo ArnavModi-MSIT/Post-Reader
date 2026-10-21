@@ -49,11 +49,11 @@ def main():
                 page.locator('#search-url').fill('https://www.linkedin.com/jobs/search/?keywords=python&location=India')
                 page.locator('#limit').fill('10')
                 page.locator('#delay').fill('1')
-                page.locator('#workers').select_option('2')
+                page.locator('#workers').select_option('3')
                 page.get_by_role('button', name='Start collection').click()
                 expect(page.locator('#saved')).to_have_text('2')
                 assert 'keywords=python' in received[0].url
-                assert received[0].workers == 2
+                assert received[0].workers == 3
                 assert page.locator('#start').is_disabled()
                 page.get_by_role('button', name='View description').first.click()
                 page.locator('#job-dialog').wait_for(state='visible')

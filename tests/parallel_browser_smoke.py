@@ -22,7 +22,7 @@ def main():
         context = p.chromium.launch_persistent_context(profile, executable_path=str(chrome) if chrome.exists() else None,
             headless=True, args=[f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1"])
         original = context.pages[0]
-        barrier = threading.Barrier(2)
+        barrier = threading.Barrier(3)
         owners = set()
         guard = threading.Lock()
 
@@ -37,18 +37,18 @@ def main():
         worker = None
         try:
             with patch.object(reader, "read_job", side_effect=fixture_read):
-                worker = ParallelDetailReader(f"http://127.0.0.1:{port}", delay=0)
-                urls = [f"https://www.linkedin.com/jobs/view/{number}/" for number in (123, 456)]
+                worker = ParallelDetailReader(f"http://127.0.0.1:{port}", delay=0, workers=3)
+                urls = [f"https://www.linkedin.com/jobs/view/{number}/" for number in (123, 456, 789)]
                 worker.prime(urls)
                 records = [worker.read(url) for url in urls]
                 assert [row["link"] for row in records] == urls
-                assert len(owners) == 2, owners
+                assert len(owners) == 3, owners
                 worker.close()
                 worker = None
             original.wait_for_timeout(100)
             assert not original.is_closed()
             assert len(context.pages) == 1, len(context.pages)
-            print("Parallel CDP fixture passed: two owning threads overlap, correct records returned, worker tabs cleaned up, original tab preserved. No job-site requests.")
+            print("Parallel CDP fixture passed: three owning threads overlap, correct records returned, worker tabs cleaned up, original tab preserved. No job-site requests.")
         finally:
             if worker:
                 worker.close()

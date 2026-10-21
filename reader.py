@@ -5,6 +5,9 @@ import json
 import math
 import re
 import sqlite3
+import os
+import tempfile
+import time
 import internshala
 import linkedin
 from seen_postings import SeenPostings
@@ -292,11 +295,37 @@ class DetailReader:
 
 
 def save_result(path, result):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     result["updated_at"] = datetime.now(timezone.utc).isoformat()
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
+    payload = json.dumps(result, ensure_ascii=False, indent=2)
+    descriptor, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    temp = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    # Dashboard reads, indexing or security software can briefly deny Windows
+    # replacement. Retry the already-written snapshot; never truncate the target.
+    delays = (0.05, 0.1, 0.2, 0.4, 0.8, 0.8)
+    for attempt in range(len(delays) + 1):
+        try:
+            temp.replace(path)
+            return
+        except PermissionError as exc:
+            if attempt == len(delays):
+                raise PermissionError(
+                    f"Checkpoint stayed locked after {attempt + 1} attempts. "
+                    f"Previous checkpoint preserved; unsaved snapshot retained at {temp}. Original error: {exc}"
+                ) from exc
+            time.sleep(delays[attempt])
 
 
 def next_results(page):
@@ -512,8 +541,10 @@ def prepare_output(args, result, search):
         result.clear()
         result.update(previous)
         successful = {posting_key(job["link"]) for job in result["jobs"]}
+        checkpoint_source = "internshala" if urlsplit(search).hostname in internshala.HOSTS else "linkedin"
         failed = list(dict.fromkeys(error.get("link") for error in result["errors"]
-                                    if posting_key(error.get("link")) and posting_key(error["link"]) not in successful))
+                                    if posting_key(error.get("link")) and posting_key(error["link"])[0] == checkpoint_source
+                                    and posting_key(error["link"]) not in successful))
         progress = result["progress"]
         progress["attempted_links"] = [url for url in progress["attempted_links"] if url not in failed]
         progress["pending_links"] = list(dict.fromkeys(failed + progress["pending_links"]))
@@ -573,10 +604,10 @@ def run_browser(args, result, output):
                 page.set_default_timeout(10000)
                 page._reader_stop_event = getattr(args, "stop_event", None)
             workers = getattr(args, "workers", 1)
-            if workers == 2:
+            if workers > 1:
                 if args.launch:
-                    raise ValueError("Two readers require CDP Chrome. Use the dashboard or omit --launch.")
-                detail = ParallelDetailReader(args.cdp, getattr(args, "stop_event", None), args.delay)
+                    raise ValueError("Parallel readers require CDP Chrome. Use the dashboard or omit --launch.")
+                detail = ParallelDetailReader(args.cdp, getattr(args, "stop_event", None), args.delay, workers=workers)
             else:
                 detail = DetailReader(context, owned_pages, getattr(args, "stop_event", None))
             result["workers"] = workers
@@ -643,13 +674,13 @@ def main():
     parser.add_argument("--fresh", action="store_true", help="Start an independent run instead of resuming today's JSON")
     parser.add_argument("--retry-incomplete", action="store_true", help="Repair previously incomplete postings for the selected website")
     parser.add_argument("--retries", type=int, default=1, help="Transient retries per listing (0..3)")
-    parser.add_argument("--workers", type=int, choices=(1, 2), default=1, help="Independent detail readers (default: 1)")
+    parser.add_argument("--workers", type=int, choices=(1, 2, 3), default=1, help="Independent detail readers (default: 1)")
     parser.add_argument("--delay", type=float, default=3.0)
     args = parser.parse_args()
     if not 0 <= args.retries <= 3 or not 1 <= args.limit <= 1000 or not math.isfinite(args.delay) or args.delay < 1:
         parser.error("--limit must be 1..1000 and --delay must be a finite number of at least 1")
-    if args.launch and args.workers == 2:
-        parser.error("--workers 2 uses debug-enabled Chrome; omit --launch")
+    if args.launch and args.workers > 1:
+        parser.error("Parallel readers use debug-enabled Chrome; omit --launch")
     return execute(args)[1]
 
 

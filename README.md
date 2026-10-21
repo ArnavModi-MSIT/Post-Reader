@@ -121,10 +121,12 @@ Internshala also supports infinite scrolling: each loaded batch is saved, then t
 
 Internshala jobs are supported alongside internships. Choose **Internshala jobs** or paste `https://internshala.com/jobs/work-from-home/salary-6`. `/jobs/`, `/fresher-jobs/` and `/internships/` searches retain their filters and share scrolling, checkpoints and history. Job records include `listing_type`, available `salary` and `experience` fields. Job and internship identity namespaces are separate to avoid collisions while preserving existing internship history.
 
-## Two detail readers
+## Parallel detail readers
 
-Choose **2 readers — parallel** in the dashboard, or add `--workers 2` to the CDP CLI command. Each worker owns its Playwright connection and detail tab; both attach to the same dedicated Chrome login session. One coordinator writes JSON and SQLite. The saved target, global duplicate protection and checkpoint queue still apply. Single-reader mode remains the default.
+Choose **2 readers — parallel** or **3 readers — parallel** in the dashboard, or add `--workers 2` or `--workers 3` to the CDP CLI command. Each worker owns its Playwright connection and detail tab; all attach to the same dedicated Chrome login session. One coordinator writes JSON and SQLite. The saved target, global duplicate protection and checkpoint queue still apply. Single-reader mode remains the default.
 
-Delay applies separately to each reader. Two description requests can overlap, so actual throughput may improve, but it is not guaranteed to double. Stop or verification prevents further scheduling; in-flight browser operations may finish before worker tabs close. Unsaved work remains pending for resume. Two-reader mode also supports repair passes. It requires CDP and cannot be combined with `--launch`.
+Delay applies separately to each reader. Up to three description requests can overlap, so actual throughput may improve, but it is not guaranteed to double. Stop or verification prevents further scheduling; in-flight browser operations may finish before worker tabs close. Unsaved work remains pending for resume. Parallel mode also supports repair passes. It requires CDP and cannot be combined with `--launch`.
 
 Run `python tests/parallel_browser_smoke.py` for the isolated CDP concurrency fixture; it starts temporary Chrome and never contacts a job website.
+
+Checkpoint saves use a unique, flushed temporary snapshot and retry temporary Windows replacement locks for up to about 2.4 seconds. If the lock persists, the previous JSON is preserved and the failure message gives the retained `.tmp` snapshot path. Keep **Resume today's progress** checked after restarting; saved jobs and pending links continue from the checkpoint. A retained snapshot can contain newer work than the last successful checkpoint.

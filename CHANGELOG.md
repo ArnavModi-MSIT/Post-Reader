@@ -1,5 +1,14 @@
 # Changes
 
+## 2026-10-21 — Three readers and durable Windows saves
+
+- Support one, two or three independent detail readers through the dashboard and CLI.
+- Retry transient Windows checkpoint replacement locks with unique, flushed temporary files; preserve recovery snapshots after persistent locks.
+- Fix a parallel-future polling race and reject invalid worker counts before starting threads.
+- Skip malformed local result files and recover dashboard defaults from invalid settings.
+- Keep failed checkpoint retries within their original source.
+- Add checkpoint-lock, three-reader CDP, timeout-race and malformed-file regression coverage.
+
 ## 2026-10-19 — Reliability and repair
 
 - Preserve existing checkpoints on Chrome/SQLite/startup errors and reject mismatched search checkpoints.

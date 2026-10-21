@@ -82,6 +82,19 @@ class DashboardTests(unittest.TestCase):
             self.manager.read_file(path.name)
         self.assertLessEqual(len(self.manager.cache), 45)
 
+    def test_malformed_local_files_do_not_break_polling(self):
+        folder = Path(self.temp.name)
+        (folder / "ui_settings.json").write_text("null", encoding="utf-8")
+        for index, bad in enumerate((dict(jobs=[], errors=[], progress=[]),
+                                     dict(jobs=[{"title": 42}], errors=[]),
+                                     dict(jobs=[], errors=[], search_url=[]))):
+            (folder / f"bad_{index}.json").write_text(json.dumps(bad), encoding="utf-8")
+        _, body = self.request("/api/state")
+        state = json.loads(body)
+        self.assertEqual(state["saved"], 1)
+        self.assertIsInstance(state["settings"], dict)
+        self.assertEqual(len(state["history"]), 1)
+
     def test_download_preserves_saved_records(self):
         _, data = self.request("/api/download?file=jobs_sample.json")
         self.assertEqual(len(json.loads(data)["jobs"]), 1)

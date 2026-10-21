@@ -1,4 +1,4 @@
-"""Two independent Playwright workers; results are committed by the coordinator."""
+"""Independent Playwright workers; results are committed by the coordinator."""
 import queue
 import threading
 import time
@@ -39,6 +39,8 @@ def browser_session(cdp, stop):
 
 class ParallelDetailReader:
     def __init__(self, cdp, stop_event=None, delay=3, workers=2, session_factory=None):
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers not in (1, 2, 3):
+            raise ValueError("Choose one, two or three readers.")
         self.abort = threading.Event()
         self.stop = StopSignal(stop_event, self.abort)
         self.external_stop = stop_event
@@ -115,7 +117,9 @@ class ParallelDetailReader:
                     return future.result(timeout=0.1)
                 except TimeoutError:
                     if future.done():
-                        raise  # A real TimeoutError raised by the detail reader.
+                        # Completion may race with the polling timeout. Read the
+                        # finished future again; actual task errors still propagate.
+                        return future.result()
         finally:
             self.pending.pop(url, None)
             self._fill()

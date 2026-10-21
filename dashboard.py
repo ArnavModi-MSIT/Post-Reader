@@ -79,6 +79,17 @@ class Manager:
             raise ValueError("Not a job-result file.")
         if any(not isinstance(job, dict) for job in value["jobs"]):
             raise ValueError("Invalid job records.")
+        if not isinstance(value.get("progress", {}), dict):
+            raise ValueError("Invalid result progress.")
+        progress = value.get("progress", {})
+        for key in ("pending_links", "attempted_links"):
+            if not isinstance(progress.get(key, []), list):
+                raise ValueError("Invalid result queue.")
+        if not isinstance(value.get("search_url", ""), str):
+            raise ValueError("Invalid result search URL.")
+        for job in value["jobs"]:
+            if any(key in job and not isinstance(job[key], str) for key in ("title", "company", "description", "job_id", "link")):
+                raise ValueError("Invalid job fields.")
         with self.lock:
             self.cache[name] = (stamp, value)
             while len(self.cache) > 45:
@@ -102,7 +113,10 @@ class Manager:
 
     def settings(self):
         try:
-            return json.loads((self.data_dir / "ui_settings.json").read_text(encoding="utf-8"))
+            value = json.loads((self.data_dir / "ui_settings.json").read_text(encoding="utf-8"))
+            if not isinstance(value, dict) or not isinstance(value.get("url"), str):
+                raise ValueError("Invalid settings file.")
+            return value
         except (OSError, ValueError):
             history = self.history()
             return {"url": history[0]["search_url"] if history else reader.DEFAULT_SEARCH, "limit": 1000, "delay": 3}
@@ -116,8 +130,8 @@ class Manager:
         if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < 1:
             raise ValueError("Delay must be at least one second.")
         workers = payload.get("workers", 1)
-        if isinstance(workers, bool) or not isinstance(workers, int) or workers not in (1, 2):
-            raise ValueError("Choose one or two readers.")
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers not in (1, 2, 3):
+            raise ValueError("Choose one, two or three readers.")
         retry_incomplete = payload.get("retry_incomplete", False)
         if not isinstance(retry_incomplete, bool):
             raise ValueError("Invalid repair setting.")

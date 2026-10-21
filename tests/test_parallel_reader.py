@@ -1,4 +1,5 @@
 import threading
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import json
 import tempfile
 import unittest
@@ -12,6 +13,53 @@ from parallel_reader import ParallelDetailReader
 
 
 class ParallelTests(unittest.TestCase):
+    def test_poll_timeout_racing_with_completed_future_returns_result(self):
+        worker = ParallelDetailReader("unused", workers=1)
+        future = Mock()
+        future.result.side_effect = [FutureTimeoutError("poll expired"), {"link": "one"}]
+        future.done.return_value = True
+        worker.pending["one"] = future
+        try:
+            self.assertEqual(worker.read("one"), {"link": "one"})
+        finally:
+            worker.close()
+
+    def test_actual_future_timeout_error_is_not_swallowed(self):
+        worker = ParallelDetailReader("unused", workers=1)
+        future = Mock()
+        future.result.side_effect = FutureTimeoutError("task failed")
+        future.done.return_value = True
+        worker.pending["one"] = future
+        try:
+            with self.assertRaisesRegex(FutureTimeoutError, "task failed"):
+                worker.read("one")
+        finally:
+            worker.close()
+
+    def test_invalid_worker_counts_are_rejected_before_starting_threads(self):
+        for workers in (True, 2.0, None, 0, 4):
+            with self.subTest(workers=workers), self.assertRaises(ValueError):
+                ParallelDetailReader("unused", workers=workers)
+
+    def test_three_readers_overlap_with_three_distinct_sessions(self):
+        barrier = threading.Barrier(3)
+        owners = set()
+        @contextmanager
+        def factory(stop):
+            owner = threading.get_ident()
+            def read(url):
+                owners.add(owner)
+                barrier.wait(timeout=3)
+                return {"link": url}
+            yield read
+        worker = ParallelDetailReader("unused", workers=3, delay=0, session_factory=factory)
+        try:
+            worker.prime(["one", "two", "three"])
+            self.assertEqual([worker.read(url)["link"] for url in ("one", "two", "three")], ["one", "two", "three"])
+            self.assertEqual(len(owners), 3)
+        finally:
+            worker.close()
+
     def test_coordinator_alone_writes_and_prefetch_respects_target_and_history(self):
         from seen_postings import SeenPostings
         owner = threading.get_ident()
